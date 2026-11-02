@@ -55,6 +55,16 @@ sudo systemctl enable sms-gateway
 sudo systemctl start sms-gateway
 ```
 
+## Delivery Mode
+
+By default the service sends SMS straight to Telegram (`DELIVERY_MODE=telegram`,
+needs `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`). For the legacy relay server
+set `DELIVERY_MODE=relay` in `.env`, or add `--mode relay` to `ExecStart`:
+
+```ini
+ExecStart=/opt/sms-gateway/venv/bin/python3 /opt/sms-gateway/main.py --mode relay
+```
+
 ## Service Management
 
 Check status:
