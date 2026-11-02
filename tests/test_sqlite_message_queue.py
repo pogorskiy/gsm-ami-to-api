@@ -334,3 +334,16 @@ def test_close_writes_memory_messages_or_logs_loss(db_path, caplog):
     queue2._memory.enqueue(_sms("saved on close"), None)  # left by an earlier write error
     queue2.close()
     assert [row['message'] for row in _rows(db_path)] == ["saved on close"]
+
+
+def test_close_reopens_database_without_waiting(db_path, tmp_path):
+    """On close, a database that works again is used at once (no REOPEN_INTERVAL wait)."""
+    db_dir = tmp_path / "later"
+    path = str(db_dir / "queue.db")
+    queue = SQLiteMessageQueue(path)  # fails: no directory yet
+    queue.enqueue(_sms("kept"), None)
+    db_dir.mkdir()
+
+    queue.close()
+
+    assert [row['message'] for row in _rows(path)] == ["kept"]

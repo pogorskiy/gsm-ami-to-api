@@ -324,3 +324,19 @@ def test_drain_returns_quickly_without_data(pair):
     start = time.monotonic()
     client.drain(timeout=0.1)
     assert time.monotonic() - start < 1.0
+
+
+def test_drain_waits_for_rest_of_half_received_sms(pair):
+    """An SMS half-received at stop: drain waits for its end (gateway sends it later)."""
+    client, gateway = pair
+    gateway.sendall(SMS_EVENT[:30])
+
+    def send_rest():
+        time.sleep(0.8)  # longer than one read timeout
+        gateway.sendall(SMS_EVENT[30:])
+
+    threading.Thread(target=send_rest, daemon=True).start()
+    client.drain(timeout=0.3, limit=5.0)
+    client.close()
+
+    assert client.read_event().fields['Sender'] == '.INECOBANK'

@@ -403,12 +403,12 @@ class AMIClient:
         if len(self._pending_lines) > MAX_MESSAGE_LINES or size > MAX_BUFFER_BYTES:
             raise MessageTooLarge(f"{len(self._pending_lines)} lines, {size} bytes")
     
-    def drain(self, timeout: float = 0.2, limit: float = 2.0) -> None:
+    def drain(self, timeout: float = 0.3, limit: float = 5.0) -> None:
         """Read what the gateway has already sent, before closing.
         
         Complete events are kept and returned by read_event later, even
-        without a connection. Stops when no data comes within timeout,
-        or after limit seconds in total.
+        without a connection. Stops when no data comes within timeout and no
+        message is half-received, or after limit seconds in total.
         """
         deadline = time.monotonic() + limit
         while self._connected and self._socket and time.monotonic() < deadline:
@@ -416,6 +416,9 @@ class AMIClient:
                 message = self._read_message(timeout=timeout)
             except socket.error:
                 break
+            if message is None and (self._pending_lines or self._buffer.strip()):
+                # A message is half-received: wait for the rest
+                continue
             if not message:
                 # None - no more data; {} - connection closed
                 break

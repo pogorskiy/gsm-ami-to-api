@@ -269,6 +269,8 @@ class SQLiteMessageQueue:
         Messages kept in memory are written first if the database works again;
         if not, the loss is logged.
         """
+        # Last chance: try to open the file now, without waiting for REOPEN_INTERVAL
+        self._next_open_time = 0.0
         self._retry_unsaved()
         lost = self._memory.size() + len(self._memory_failed)
         if lost:
