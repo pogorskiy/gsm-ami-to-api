@@ -78,6 +78,12 @@ class SMSGatewayService:
         self._delivery_retry_count = 0
         self._last_delivery_attempt = 0
         
+        # Reconnection schedule (no sleeping in the main loop)
+        self._reconnect_attempt = 0
+        # (time.monotonic(): a change of the system clock does not break it)
+        self._next_reconnect_time = 0.0
+        self._last_connect_time = float('-inf')
+        
         # Application-level keepalive tracking (optional, 0 to disable)
         self._last_ping_time = 0
         self._ping_interval = config.ping_interval
@@ -88,7 +94,8 @@ class SMSGatewayService:
         """Start the service by connecting and authenticating with TG100.
         
         This method performs the initial connection and authentication sequence.
-        If either fails, the service will log an error and exit.
+        If either fails, the service will log an error and exit - unless SMS
+        were already received: then it returns False and run() reconnects.
         
         Returns:
             True if startup successful, False otherwise
@@ -106,10 +113,15 @@ class SMSGatewayService:
         if not self.ami_client.login():
             logger.error("Failed to authenticate with TG100")
             self.ami_client.close()
+            if self.ami_client.has_early_events():
+                # SMS already received: do not exit, run() delivers them and reconnects
+                logger.error("SMS received before the failure - delivering them and reconnecting")
+                return False
             sys.exit(1)
         
         # Transition to monitoring state
         self.state = ServiceState.MONITORING
+        self._last_connect_time = time.monotonic()
         logger.info("Service started successfully - entering monitoring state")
         return True
 
@@ -130,8 +142,16 @@ class SMSGatewayService:
             try:
                 # Check if we need to reconnect
                 if not self.ami_client.is_connected():
+                    # First deliver all that was already received
+                    self.ami_client.keep_received_events()
+                    self._process_early_events()
+                    # Reconnect has priority: deliver more only while it is not due
+                    while self._process_queue():
+                        if self._reconnect_due():
+                            break
                     if not self._reconnect():
-                        # Reconnection failed, continue trying
+                        # Not connected yet: short pause, then queue and reconnect again
+                        time.sleep(0.1)
                         continue
                 
                 # Optional: Send keepalive ping (if enabled)
@@ -176,6 +196,13 @@ class SMSGatewayService:
                 # Continue running despite errors
                 time.sleep(1)
     
+    def _process_early_events(self) -> None:
+        """Queue SMS events that were received before the connection was lost."""
+        while self.ami_client.has_early_events():
+            event = self.ami_client.read_event()
+            if event is not None and event.event_type in ['DongleNewSMSBase64', 'ReceivedSMS']:
+                self._process_sms_event(event)
+    
     def _process_sms_event(self, event) -> None:
         """Process an SMS event (DongleNewSMSBase64 or ReceivedSMS).
         
@@ -201,17 +228,20 @@ class SMSGatewayService:
         self.message_queue.enqueue(sms_message, signature)
         logger.info(f"Added message to queue (queue size: {self.message_queue.size()})")
     
-    def _process_queue(self) -> None:
+    def _process_queue(self) -> bool:
         """Process the message delivery queue.
         
         Attempts to deliver the first message in the queue. On success or
         permanent failure, removes the message. On temporary failure, keeps
         the message and implements exponential backoff for retries.
+        
+        Returns:
+            True if a message was removed from the queue (call again for the next one)
         """
         if self.message_queue.is_empty():
             # Reset retry counter when queue is empty
             self._delivery_retry_count = 0
-            return
+            return False
         
         # Check if we need to wait before retry
         current_time = time.time()
@@ -226,12 +256,12 @@ class SMSGatewayService:
             time_since_last_attempt = current_time - self._last_delivery_attempt
             if time_since_last_attempt < delay:
                 # Not enough time has passed, wait
-                return
+                return False
         
         # Peek at first message without removing it
         item = self.message_queue.peek()
         if item is None:
-            return
+            return False
         
         message, signature = item
         
@@ -244,12 +274,16 @@ class SMSGatewayService:
             self.message_queue.dequeue()
             logger.info(f"Message delivered successfully (queue size: {self.message_queue.size()})")
             self._delivery_retry_count = 0
+            self._last_delivery_attempt = 0  # next message goes without a pause
+            return True
             
         elif result is False:
             # Permanent failure - remove from queue
             self.message_queue.dequeue()
             logger.error(f"Message delivery failed permanently - discarding (queue size: {self.message_queue.size()})")
             self._delivery_retry_count = 0
+            self._last_delivery_attempt = 0
+            return True
             
         else:  # result is None
             # Temporary failure - keep in queue and increment retry counter
@@ -260,54 +294,64 @@ class SMSGatewayService:
                 self.config.max_retry_delay
             )
             logger.info(f"Message delivery failed temporarily - will retry in {next_delay} seconds")
+            return False
 
+    def _reconnect_due(self) -> bool:
+        """Check if a reconnection attempt should be made now."""
+        if self.state != ServiceState.RECONNECTING:
+            return True
+        return time.monotonic() >= self._next_reconnect_time
+    
     def _reconnect(self) -> bool:
         """Handle reconnection to TG100 with exponential backoff.
         
-        Attempts to reconnect and re-authenticate with TG100 using exponential
-        backoff. Continues indefinitely until successful.
+        Does not sleep: if the next attempt is not due yet, returns False at
+        once, so the main loop keeps delivering the queue between attempts.
         
         Returns:
             True if reconnection successful, False if should retry later
         """
+        now = time.monotonic()
         if self.state != ServiceState.RECONNECTING:
-            # First reconnection attempt
+            # First reconnection attempt: at once, but not more often than
+            # initial_retry_delay after the last successful connect
             self.state = ServiceState.RECONNECTING
             self._reconnect_attempt = 0
+            self._next_reconnect_time = max(now, self._last_connect_time + self.config.initial_retry_delay)
             logger.error("Connection lost - entering reconnection mode")
         
-        # Calculate backoff delay
-        delay = calculate_exponential_backoff(
-            self._reconnect_attempt,
-            self.config.initial_retry_delay,
-            self.config.max_retry_delay
-        )
+        if now < self._next_reconnect_time:
+            return False
         
-        logger.info(f"Attempting reconnection (attempt {self._reconnect_attempt + 1}, delay: {delay}s)")
-        
-        # Wait before attempting
-        time.sleep(delay)
+        logger.info(f"Attempting reconnection (attempt {self._reconnect_attempt + 1})")
         
         # Close any existing connection
         self.ami_client.close()
         
-        # Attempt to connect
-        if not self.ami_client.connect():
+        connected = self.ami_client.connect()
+        if not connected:
             logger.error("Reconnection attempt failed - will retry")
-            self._reconnect_attempt += 1
-            return False
-        
-        # Attempt to authenticate
-        if not self.ami_client.login():
+        elif not self.ami_client.login():
             logger.error("Re-authentication failed - will retry")
             self.ami_client.close()
+            connected = False
+        
+        if not connected:
+            delay = calculate_exponential_backoff(
+                self._reconnect_attempt,
+                self.config.initial_retry_delay,
+                self.config.max_retry_delay
+            )
             self._reconnect_attempt += 1
+            self._next_reconnect_time = time.monotonic() + delay
+            logger.info(f"Next reconnection attempt in {delay}s")
             return False
         
         # Success!
         logger.info("Reconnection successful - resuming monitoring")
         self.state = ServiceState.MONITORING
         self._reconnect_attempt = 0
+        self._last_connect_time = time.monotonic()
         return True
     
     def stop(self) -> None:

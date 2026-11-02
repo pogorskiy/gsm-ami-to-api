@@ -1,5 +1,6 @@
 """Tests for SMS Gateway Service orchestrator."""
 
+import time
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 from sms_gateway_service import SMSGatewayService, ServiceState
@@ -77,6 +78,7 @@ def test_start_authentication_failure(mock_exit, mock_ami_class, mock_config):
     mock_ami = Mock()
     mock_ami.connect.return_value = True
     mock_ami.login.return_value = False
+    mock_ami.has_early_events.return_value = False
     mock_ami_class.return_value = mock_ami
     
     service = SMSGatewayService(mock_config)
@@ -263,3 +265,111 @@ def test_relay_mode_uses_api_client(mock_config):
     service = SMSGatewayService(mock_config)
 
     assert isinstance(service.api_client, APIDeliveryClient)
+
+
+def test_early_events_are_queued_before_reconnect(mock_config):
+    """SMS received before the connection dropped are queued and delivered without a new connection."""
+    service = SMSGatewayService(mock_config)
+    event = AMIEvent('ReceivedSMS', {'Event': 'ReceivedSMS', 'Sender': '+374', 'Content': 'code'})
+    service.ami_client._early_events.append(event.fields)
+    service.ami_client._connected = False
+    service.api_client.send_message = Mock(return_value=True)
+
+    service._process_early_events()
+    service._process_queue()
+
+    assert not service.ami_client.has_early_events()
+    assert service.message_queue.is_empty()
+    sent_message = service.api_client.send_message.call_args.args[0]
+    assert sent_message.message == 'code'
+
+
+@patch('sms_gateway_service.AMIClient')
+@patch('sys.exit')
+def test_start_login_failure_with_received_sms_does_not_exit(mock_exit, mock_ami_class, mock_config):
+    """SMS received during the first Login must not be lost by exiting."""
+    mock_ami = Mock()
+    mock_ami.connect.return_value = True
+    mock_ami.login.return_value = False
+    mock_ami.has_early_events.return_value = True
+    mock_ami_class.return_value = mock_ami
+
+    service = SMSGatewayService(mock_config)
+
+    assert service.start() is False
+    mock_exit.assert_not_called()
+
+
+def test_queue_is_drained_without_pauses(mock_config):
+    """After a successful delivery the next message goes at once."""
+    service = SMSGatewayService(mock_config)
+    for i in range(3):
+        service.message_queue.enqueue(SMSMessage("1", "+374", f"sms {i}"), None)
+    service.api_client.send_message = Mock(return_value=True)
+
+    while service._process_queue():
+        pass
+
+    assert service.message_queue.is_empty()
+    assert service.api_client.send_message.call_count == 3
+
+
+def test_queue_drain_stops_on_temporary_failure(mock_config):
+    service = SMSGatewayService(mock_config)
+    for i in range(3):
+        service.message_queue.enqueue(SMSMessage("1", "+374", f"sms {i}"), None)
+    service.api_client.send_message = Mock(return_value=None)
+
+    while service._process_queue():
+        pass
+
+    assert service.message_queue.size() == 3
+    assert service.api_client.send_message.call_count == 1
+
+
+def test_reconnect_does_not_block_while_waiting(mock_config):
+    """Between attempts _reconnect returns at once, so the queue keeps being delivered."""
+    service = SMSGatewayService(mock_config)
+    service.ami_client.connect = Mock(return_value=False)
+    service.ami_client.close = Mock()
+
+    assert service._reconnect() is False        # first attempt happens at once
+    assert service.ami_client.connect.call_count == 1
+
+    start = time.monotonic()
+    assert service._reconnect() is False        # next attempt is not due yet
+    assert time.monotonic() - start < 0.1
+    assert service.ami_client.connect.call_count == 1
+
+    service._next_reconnect_time = 0            # time has come
+    assert service._reconnect() is False
+    assert service.ami_client.connect.call_count == 2
+
+
+def test_reconnect_has_priority_over_draining_queue(mock_config):
+    """With a due reconnect only one message is sent before reconnecting."""
+    service = SMSGatewayService(mock_config)
+    for i in range(5):
+        service.message_queue.enqueue(SMSMessage("1", "+374", f"sms {i}"), None)
+    service.api_client.send_message = Mock(return_value=True)
+
+    assert service._reconnect_due()  # just lost the connection: reconnect at once
+    while service._process_queue():
+        if service._reconnect_due():
+            break
+
+    assert service.api_client.send_message.call_count == 1
+    assert service.message_queue.size() == 4
+
+
+def test_reconnect_schedule_uses_monotonic_clock(mock_config):
+    service = SMSGatewayService(mock_config)
+    service.ami_client.connect = Mock(return_value=False)
+    service.ami_client.close = Mock()
+
+    with patch('sms_gateway_service.time.time', return_value=0):  # wall clock jumps back
+        service._reconnect()
+        service._next_reconnect_time = 0
+        service._reconnect()
+
+    assert service.ami_client.connect.call_count == 2

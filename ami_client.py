@@ -3,7 +3,9 @@
 import socket
 import select
 import base64
-from typing import Dict, Optional
+import time
+from collections import deque
+from typing import Deque, Dict, List, Optional
 from datetime import datetime, timezone
 from sms_message import SMSMessage
 from logging_config import get_logger
@@ -13,6 +15,18 @@ logger = get_logger(__name__)
 
 # Trace file for AMI protocol debugging
 TRACE_FILE = 'trace.log'
+
+# Time limits (seconds)
+BANNER_TIMEOUT = 10.0  # waiting for the AMI banner after connect
+LOGIN_TIMEOUT = 30.0   # waiting for the Login response
+
+# Limits for one message: protect memory from a broken stream
+MAX_MESSAGE_LINES = 1000
+MAX_BUFFER_BYTES = 1024 * 1024  # buffer + lines of the unfinished message
+
+
+class MessageTooLarge(Exception):
+    """An AMI message exceeds MAX_MESSAGE_LINES or MAX_BUFFER_BYTES."""
 
 
 def _write_trace(direction: str, data: str) -> None:
@@ -81,6 +95,9 @@ class AMIClient:
         self._socket: Optional[socket.socket] = None
         self._connected = False
         self._buffer = b''  # Persistent buffer for incomplete messages
+        self._pending_lines: List[str] = []  # Lines of a message not finished yet
+        self._pending_bytes = 0  # Size of _pending_lines
+        self._early_events: Deque[Dict[str, str]] = deque()  # Events received while waiting for Login response
         
         # Initialize trace file
         try:
@@ -113,29 +130,33 @@ class AMIClient:
             self._socket.setblocking(False)
             
             self._connected = True
-            self._buffer = b''  # Clear buffer for new connection
+            self._reset_parser()
             
             # Read and log the AMI banner (with timeout for initial read)
             banner_bytes = b''
-            start_time = datetime.now(timezone.utc)
+            deadline = time.monotonic() + BANNER_TIMEOUT
             while b'\n' not in banner_bytes:
-                ready = select.select([self._socket], [], [], 1.0)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.error("Timeout while reading banner")
+                ready = select.select([self._socket], [], [], min(remaining, 1.0))
                 if not ready[0]:
-                    # Check if we've been waiting too long
-                    if (datetime.now(timezone.utc) - start_time).total_seconds() > 10:
-                        raise socket.error("Timeout while reading banner")
                     continue
                 
                 try:
                     chunk = self._socket.recv(1024)
-                    if not chunk:
-                        raise socket.error("Connection closed while reading banner")
-                    banner_bytes += chunk
-                except (BlockingIOError, socket.error):
+                except (BlockingIOError, InterruptedError):
                     continue
+                if not chunk:
+                    # EOF goes to the error handler below - no retry on a closed socket
+                    raise socket.error("Connection closed while reading banner")
+                banner_bytes += chunk
             
-            banner = banner_bytes.decode('utf-8').split('\n')[0] + '\n'
+            banner_line, rest = banner_bytes.split(b'\n', 1)
+            banner = banner_line.decode('utf-8', errors='replace') + '\n'
             _write_trace('RECV', banner)
+            # Data after the banner belongs to the next messages - keep it
+            self._buffer = rest
             
             logger.info(f"Connected to TG100 at {self.host}:{self.port}")
             logger.info(f"TG100 Banner: {banner.strip()}")
@@ -144,6 +165,12 @@ class AMIClient:
         except (socket.error, socket.timeout) as e:
             logger.error(f"Failed to connect to {self.host}:{self.port}: {e}")
             self._connected = False
+            if self._socket:
+                try:
+                    self._socket.close()
+                except OSError:
+                    pass
+                self._socket = None
             return False
     
     def login(self) -> bool:
@@ -172,9 +199,16 @@ class AMIClient:
             
             self._socket.sendall(login_cmd.encode("utf-8"))
 
-            # Wait for Login Response, ignoring Events and other noise
+            # Wait for Login Response, keeping Events; give up after LOGIN_TIMEOUT
+            deadline = time.monotonic() + LOGIN_TIMEOUT
             while True:
-                response = self._read_message(timeout=10.0)  # Longer timeout for login
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error(f"No Login response from TG100 in {LOGIN_TIMEOUT:.0f} seconds")
+                    self._connected = False
+                    return False
+                
+                response = self._read_message(timeout=min(remaining, 10.0))
                 
                 if response is None:
                     # Timeout - no data yet, keep waiting
@@ -197,7 +231,9 @@ class AMIClient:
                     logger.error("Full response details: %s", response)
                     return False
 
-                # If this is not a Response, but an Event or something else - just ignore and continue reading
+                # An event (maybe a new SMS) came before the Login response - keep it for read_event
+                if 'Event' in response:
+                    self._early_events.append(response)
 
         except (socket.error, socket.timeout) as e:
             logger.error(f"Login failed: {e}")
@@ -210,6 +246,13 @@ class AMIClient:
         Returns:
             AMIEvent object if an event was read, None if no data available (timeout) or not an event
         """
+        # Events already received are returned even if the connection is gone
+        if self._early_events:
+            message = self._early_events.popleft()
+            event_type = message['Event']
+            logger.info(f"Received event type: {event_type}")
+            return AMIEvent(event_type, message)
+        
         if not self._connected or not self._socket:
             return None
         
@@ -245,67 +288,152 @@ class AMIClient:
     def _read_message(self, timeout: float = 1.0) -> Optional[Dict[str, str]]:
         """Read a single AMI message (until blank line).
         
+        Lines of an unfinished message are kept between calls, so a message
+        that arrives in parts with long pauses is not lost. Data already in
+        the buffer is parsed before waiting for the socket.
+        
         Args:
             timeout: Timeout in seconds for select (default 1.0)
         
         Returns:
             Dictionary of key-value pairs if message complete
-            None if no data available (timeout) - connection still alive
-            Empty dict {} if connection closed (EOF)
+            None if no complete message yet (timeout) - connection still alive
+            Empty dict {} if connection closed (EOF) or socket error
         """
-        raw_lines = []
-        
+        deadline = time.monotonic() + timeout
         try:
             while True:
-                # Wait for data with timeout
-                ready = select.select([self._socket], [], [], timeout)
-                if not ready[0]:
-                    # Timeout - no data available, but connection is alive
+                # A complete message may already be in the buffer
+                message = self._parse_buffered_message()
+                if message is not None:
+                    return message
+                
+                # Not longer than timeout in total: a socket that is always
+                # ready (a stream of blank lines) must not keep us here
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return None
                 
-                # Read data from socket
+                ready = select.select([self._socket], [], [], remaining)
+                if not ready[0]:
+                    # Timeout - unfinished lines stay in _pending_lines
+                    return None
+                
                 try:
                     chunk = self._socket.recv(4096)
-                    if not chunk:
-                        # EOF - connection closed
-                        if raw_lines:
-                            _write_trace('RECV', ''.join(raw_lines))
-                        self._connected = False
-                        return {}  # Empty dict signals EOF
-                    self._buffer += chunk
-                except (BlockingIOError, socket.error):
+                except (BlockingIOError, InterruptedError):
                     # No data available yet (shouldn't happen after select)
                     continue
                 
-                # Process complete lines
-                while b'\n' in self._buffer:
-                    line_bytes, self._buffer = self._buffer.split(b'\n', 1)
-                    try:
-                        line = line_bytes.decode('utf-8') + '\n'
-                    except UnicodeDecodeError:
-                        continue
-                    
-                    raw_lines.append(line)
-                    line_stripped = line.strip()
-                    
-                    if not line_stripped:
-                        # Blank line - end of message
-                        _write_trace('RECV', ''.join(raw_lines))
-                        # Parse all collected lines
-                        message = {}
-                        for raw_line in raw_lines:
-                            stripped = raw_line.strip()
-                            if stripped and ':' in stripped:
-                                key, value = stripped.split(':', 1)
-                                message[key.strip()] = value.strip()
-                        return message
-                    
+                if not chunk:
+                    # EOF - connection closed
+                    if self._pending_lines:
+                        _write_trace('RECV', ''.join(self._pending_lines))
+                    self._connected = False
+                    return {}  # Empty dict signals EOF
+                self._buffer += chunk
+                
+        except MessageTooLarge as e:
+            logger.error(f"AMI message too large ({e}) - dropping connection")
+            if self._pending_lines:
+                _write_trace('RECV', ''.join(self._pending_lines[:50]))
+            self._pending_lines = []
+            self._pending_bytes = 0
+            self._buffer = b''
+            self._connected = False
+            return {}
         except socket.error as e:
             logger.error(f"Socket error in _read_message: {e}")
-            if raw_lines:
-                _write_trace('RECV', ''.join(raw_lines))
+            if self._pending_lines:
+                _write_trace('RECV', ''.join(self._pending_lines))
             self._connected = False
             return {}  # Empty dict signals error
+    
+    def _parse_buffered_message(self) -> Optional[Dict[str, str]]:
+        """Take one complete message from the buffer.
+        
+        Returns:
+            Dictionary of key-value pairs if a complete message is in the buffer,
+            None if more data is needed
+        
+        Raises:
+            MessageTooLarge: the message (or a line without end) is over the limits
+        """
+        while b'\n' in self._buffer:
+            line_bytes, self._buffer = self._buffer.split(b'\n', 1)
+            # Do not drop a line with broken UTF-8: it may be the SMS text
+            line = line_bytes.decode('utf-8', errors='replace') + '\n'
+            
+            if line.strip():
+                self._pending_lines.append(line)
+                self._pending_bytes += len(line_bytes) + 1
+                self._check_limits(include_buffer=False)
+                continue
+            
+            # Blank line - end of message
+            if not self._pending_lines:
+                # Extra blank line between messages - not a message, not EOF
+                continue
+            
+            raw_lines, self._pending_lines = self._pending_lines, []
+            self._pending_bytes = 0
+            _write_trace('RECV', ''.join(raw_lines))
+            message = {}
+            for raw_line in raw_lines:
+                stripped = raw_line.strip()
+                if ':' in stripped:
+                    key, value = stripped.split(':', 1)
+                    message[key.strip()] = value.strip()
+            if message:
+                return message
+            # Only lines without ':' - nothing to return, read on
+        
+        # Now the buffer holds only an unfinished line of this message - it counts too
+        self._check_limits(include_buffer=True)
+        return None
+    
+    def _check_limits(self, include_buffer: bool) -> None:
+        """Raise MessageTooLarge if the unfinished message is over the limits.
+        
+        Args:
+            include_buffer: count the buffer too (only when it holds just the
+                unfinished line of this message, not next messages)
+        """
+        size = self._pending_bytes + (len(self._buffer) if include_buffer else 0)
+        if len(self._pending_lines) > MAX_MESSAGE_LINES or size > MAX_BUFFER_BYTES:
+            raise MessageTooLarge(f"{len(self._pending_lines)} lines, {size} bytes")
+    
+    def keep_received_events(self) -> None:
+        """Keep complete events that are still in the buffer.
+        
+        Called when the connection is lost or closed: an SMS may already be
+        fully received but not parsed yet. read_event returns them later,
+        even without a connection.
+        """
+        try:
+            while True:
+                message = self._parse_buffered_message()
+                if message is None:
+                    break
+                if 'Event' in message:
+                    self._early_events.append(message)
+        except MessageTooLarge:
+            pass
+    
+    def has_early_events(self) -> bool:
+        """Check if there are received events that read_event has not returned yet."""
+        return bool(self._early_events)
+    
+    def _reset_parser(self) -> None:
+        """Clear the parser state (for a new connection).
+        
+        Early events are kept: they are complete messages (maybe SMS)
+        that read_event has not returned yet.
+        """
+        self.keep_received_events()
+        self._buffer = b''
+        self._pending_lines = []
+        self._pending_bytes = 0
     
     def is_connected(self) -> bool:
         """Check if the client is currently connected.
@@ -345,7 +473,7 @@ class AMIClient:
             self._socket = None
         
         self._connected = False
-        self._buffer = b''  # Clear buffer on close
+        self._reset_parser()
         logger.info("Connection closed")
     
     def parse_sms_event(self, event: AMIEvent) -> Optional[SMSMessage]:
