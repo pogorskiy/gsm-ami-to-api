@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Optional
 from config import Config
 from ami_client import AMIClient
-from message_queue import MessageQueue
+from message_queue import MessageQueue, SQLiteMessageQueue
 from api_delivery_client import APIDeliveryClient
 from telegram_delivery_client import TelegramDeliveryClient
 from retry_logic import calculate_exponential_backoff
@@ -59,7 +59,7 @@ class SMSGatewayService:
             password=config.tg100_password
         )
         
-        self.message_queue = MessageQueue()
+        self.message_queue = self._create_queue(config.queue_db_path)
         
         # Delivery client: straight to Telegram, or legacy relay server
         if config.delivery_mode == 'relay':
@@ -90,12 +90,35 @@ class SMSGatewayService:
         
         logger.info(f"SMS Gateway Service initialized (delivery mode: {config.delivery_mode})")
     
+    @staticmethod
+    def _create_queue(path: Optional[str]):
+        """Create the message queue: on disk if possible, otherwise in memory.
+        
+        Args:
+            path: SQLite file for the queue; None or empty - in-memory queue
+        """
+        if not path:
+            logger.warning("QUEUE_DB_PATH not set - queue is kept in memory, a restart loses it")
+            return MessageQueue()
+        queue = SQLiteMessageQueue(path)
+        if not queue.is_open():
+            # Already logged; the queue keeps messages in memory and retries opening
+            return queue
+        pending = queue.size()
+        if pending:
+            logger.info(f"Queue database opened: {pending} message(s) waiting for delivery")
+        else:
+            logger.info("Queue database opened")
+        return queue
+    
     def start(self) -> bool:
         """Start the service by connecting and authenticating with TG100.
         
         This method performs the initial connection and authentication sequence.
         If either fails, the service will log an error and exit - unless SMS
-        were already received: then it returns False and run() reconnects.
+        are waiting for delivery (received during login, or kept in the queue
+        database from before a restart): then it returns False and run()
+        delivers them and reconnects.
         
         Returns:
             True if startup successful, False otherwise
@@ -106,6 +129,9 @@ class SMSGatewayService:
         self.state = ServiceState.CONNECTING
         if not self.ami_client.connect():
             logger.error("Failed to establish initial connection to TG100")
+            if not self.message_queue.is_empty():
+                logger.error("SMS waiting in the queue - delivering them and reconnecting")
+                return False
             sys.exit(1)
         
         # Attempt authentication
@@ -113,8 +139,8 @@ class SMSGatewayService:
         if not self.ami_client.login():
             logger.error("Failed to authenticate with TG100")
             self.ami_client.close()
-            if self.ami_client.has_early_events():
-                # SMS already received: do not exit, run() delivers them and reconnects
+            if self.ami_client.has_early_events() or not self.message_queue.is_empty():
+                # SMS waiting: do not exit, run() delivers them and reconnects
                 logger.error("SMS received before the failure - delivering them and reconnecting")
                 return False
             sys.exit(1)
@@ -264,6 +290,10 @@ class SMSGatewayService:
             return False
         
         message, signature = item
+        if self.config.delivery_mode == 'relay':
+            # Sign with the current key: the message may be queued in telegram
+            # mode (no signature) or before a key change
+            signature = message.compute_signature(self.config.hmac_secret_key)
         
         # Attempt delivery
         self._last_delivery_attempt = current_time
@@ -278,15 +308,16 @@ class SMSGatewayService:
             return True
             
         elif result is False:
-            # Permanent failure - remove from queue
-            self.message_queue.dequeue()
-            logger.error(f"Message delivery failed permanently - discarding (queue size: {self.message_queue.size()})")
+            # Permanent failure - set aside (kept on disk for a manual retry)
+            self.message_queue.mark_failed("permanent delivery failure")
+            logger.error(f"Message delivery failed permanently - set aside as failed (queue size: {self.message_queue.size()})")
             self._delivery_retry_count = 0
             self._last_delivery_attempt = 0
             return True
             
         else:  # result is None
             # Temporary failure - keep in queue and increment retry counter
+            self.message_queue.record_attempt("temporary delivery failure")
             self._delivery_retry_count += 1
             next_delay = calculate_exponential_backoff(
                 self._delivery_retry_count,
@@ -358,4 +389,5 @@ class SMSGatewayService:
         """Stop the service and clean up resources."""
         logger.info("Stopping SMS Gateway Service")
         self.ami_client.close()
+        self.message_queue.close()
         logger.info("Service stopped")

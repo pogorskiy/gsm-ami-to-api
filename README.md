@@ -16,7 +16,7 @@ python main.py                # mode from .env, default: telegram
 python main.py --mode relay   # legacy mode via relay server
 ```
 
-Telegram errors: 400 — message is discarded; 401/403/404 (wrong token or chat), 429, 5xx and network errors — message stays in queue and is retried.
+Telegram errors: 400 — message is set aside as `failed` in the queue database (retry with `queue_tool.py retry`); 401/403/404 (wrong token or chat), 429, 5xx and network errors — message stays in queue and is retried.
 
 The sections below about the remote API, message format and signature apply to `relay` mode only.
 
@@ -25,6 +25,7 @@ The sections below about the remote API, message format and signature apply to `
 - **Real-time SMS Monitoring**: Connects to TG100 via AMI protocol and processes incoming SMS messages instantly
 - **Cryptographic Signatures**: Signs all messages with HMAC-SHA256 for authenticity verification
 - **Reliable Delivery**: Message queue with exponential backoff retry logic ensures no messages are lost
+- **Persistent Queue**: The queue is stored in SQLite (`queue.db`, `QUEUE_DB_PATH`): undelivered messages survive a restart. Delivered messages are kept 7 days, failed ones 30 days. `python queue_tool.py list|show|retry` to inspect and retry them
 - **Automatic Reconnection**: Handles connection failures gracefully with automatic reconnection
 - **Comprehensive Logging**: Detailed logging with timestamps for monitoring and troubleshooting
 - **Simple Configuration**: Environment-based configuration via .env file
@@ -477,7 +478,8 @@ python -m pytest --cov=. --cov-report=html
 ├── sms_gateway_service.py       # Main service orchestrator
 ├── ami_client.py                # AMI protocol client
 ├── sms_message.py               # SMS message model
-├── message_queue.py             # Message queue implementation
+├── message_queue.py             # Message queue (SQLite on disk, or in memory)
+├── queue_tool.py                # Inspect the queue database, retry failed messages
 ├── api_delivery_client.py       # API delivery client
 ├── retry_logic.py               # Retry and backoff logic
 ├── logging_config.py            # Logging configuration

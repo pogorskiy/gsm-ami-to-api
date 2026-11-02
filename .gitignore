@@ -60,3 +60,7 @@ Thumbs.db
 
 # Kiro
 .kiro/
+
+# Persistent message queue
+queue.db
+queue.db-*

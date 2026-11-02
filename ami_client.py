@@ -490,8 +490,8 @@ class AMIClient:
             return None
         
         try:
-            # Log the full event for debugging
-            logger.info(f"Parsing SMS event: {event.fields}")
+            # Log the full event for debugging (DEBUG: SMS text stays out of the journal)
+            logger.debug(f"Parsing SMS event: {event.fields}")
             
             # Handle different event formats
             if event.event_type == 'ReceivedSMS':
@@ -514,7 +514,7 @@ class AMIClient:
                     return None
                 
                 # Content is already plain text, no decoding needed
-                logger.info(f"Message content: {message}")
+                logger.debug(f"Message content: {message}")
                 
             else:
                 # DongleNewSMSBase64 format (original)
@@ -541,7 +541,7 @@ class AMIClient:
                 try:
                     message_bytes = base64.b64decode(content_base64)
                     message = message_bytes.decode('utf-8')
-                    logger.info(f"Decoded message content: {message}")
+                    logger.debug(f"Decoded message content: {message}")
                 except Exception as e:
                     logger.warning(f"Failed to decode Base64 content: {e}")
                     return None

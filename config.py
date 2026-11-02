@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 DELIVERY_MODES = ('telegram', 'relay')
 DEFAULT_DELIVERY_MODE = 'telegram'
 
+DEFAULT_QUEUE_DB_PATH = 'queue.db'
+
 
 @dataclass
 class Config:
@@ -43,6 +45,9 @@ class Config:
     initial_retry_delay: int = 5
     max_retry_delay: int = 60
     ping_interval: int = 300  # Keepalive ping interval in seconds (0 to disable)
+    
+    # SQLite file for the message queue (survives a restart); None - in memory
+    queue_db_path: Optional[str] = DEFAULT_QUEUE_DB_PATH
     
     @staticmethod
     def load_from_env(delivery_mode: Optional[str] = None) -> 'Config':
@@ -180,4 +185,5 @@ class Config:
             initial_retry_delay=initial_retry_delay,
             max_retry_delay=max_retry_delay,
             ping_interval=ping_interval,
+            queue_db_path=os.getenv('QUEUE_DB_PATH', '').strip() or DEFAULT_QUEUE_DB_PATH,
         )

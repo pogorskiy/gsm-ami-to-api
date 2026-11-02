@@ -23,6 +23,7 @@ def mock_config():
     config.hmac_secret_key = "test-secret"
     config.initial_retry_delay = 5
     config.max_retry_delay = 60
+    config.queue_db_path = None
     return config
 
 
@@ -373,3 +374,141 @@ def test_reconnect_schedule_uses_monotonic_clock(mock_config):
         service._reconnect()
 
     assert service.ami_client.connect.call_count == 2
+
+
+@pytest.fixture
+def disk_config(mock_config, tmp_path):
+    """Configuration with the queue in an SQLite file."""
+    mock_config.queue_db_path = str(tmp_path / "queue.db")
+    return mock_config
+
+
+def _statuses(path):
+    import sqlite3
+    conn = sqlite3.connect(path)
+    try:
+        return [row[0] for row in conn.execute("SELECT status FROM messages ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def test_disk_queue_is_used_when_path_is_set(disk_config):
+    from message_queue import SQLiteMessageQueue
+    service = SMSGatewayService(disk_config)
+    assert isinstance(service.message_queue, SQLiteMessageQueue)
+    service.stop()
+
+
+def test_undelivered_sms_survive_restart(disk_config):
+    """SMS queued before a restart are delivered by the next process."""
+    service = SMSGatewayService(disk_config)
+    service.message_queue.enqueue(SMSMessage("1", "+374", "code 1234"), None)
+    service.api_client.send_message = Mock(return_value=None)  # Telegram is down
+    service._process_queue()
+    service.stop()
+
+    restarted = SMSGatewayService(disk_config)
+    restarted.api_client.send_message = Mock(return_value=True)
+    assert restarted.message_queue.size() == 1
+    assert restarted._process_queue() is True
+
+    sent = restarted.api_client.send_message.call_args[0][0]
+    assert sent.message == "code 1234"
+    assert restarted.message_queue.is_empty()
+    restarted.stop()
+    assert _statuses(disk_config.queue_db_path) == ["sent"]
+
+
+def test_permanent_failure_keeps_sms_as_failed(disk_config):
+    """A permanently failed SMS is kept on disk and does not block the next one."""
+    service = SMSGatewayService(disk_config)
+    service.message_queue.enqueue(SMSMessage("1", "+374", "bad"), None)
+    service.message_queue.enqueue(SMSMessage("1", "+374", "good"), None)
+    service.api_client.send_message = Mock(side_effect=[False, True])
+
+    while service._process_queue():
+        pass
+
+    assert service.message_queue.is_empty()
+    service.stop()
+    assert _statuses(disk_config.queue_db_path) == ["failed", "sent"]
+
+
+def test_relay_mode_signs_message_queued_without_signature(disk_config):
+    """A message queued in telegram mode (no signature) gets one in relay mode."""
+    service = SMSGatewayService(disk_config)
+    message = SMSMessage("1", "+374", "text", "2026-11-02T10:00:00Z")
+    service.message_queue.enqueue(message, None)
+    service.api_client.send_message = Mock(return_value=True)
+
+    service._process_queue()
+
+    signature = service.api_client.send_message.call_args[0][1]
+    assert signature == message.compute_signature(disk_config.hmac_secret_key)
+    service.stop()
+
+
+def test_queue_database_is_opened_later_if_it_fails_at_start(mock_config, tmp_path, monkeypatch):
+    """A database error at start does not lose SMS; the file is opened when it works."""
+    import message_queue
+    db_dir = tmp_path / "missing-dir"
+    mock_config.queue_db_path = str(db_dir / "queue.db")
+    service = SMSGatewayService(mock_config)
+    assert not service.message_queue.is_open()
+
+    service.message_queue.enqueue(SMSMessage("1", "+374", "while broken"), None)
+    assert service.message_queue.size() == 1
+
+    db_dir.mkdir()
+    monkeypatch.setattr(message_queue, "REOPEN_INTERVAL", 0)
+    service.message_queue._next_open_time = 0.0
+    assert service.message_queue.size() == 1
+    assert service.message_queue.is_open()
+    service.stop()
+    assert _statuses(mock_config.queue_db_path) == ["pending"]
+
+
+def test_relay_mode_replaces_stale_signature(disk_config):
+    """A signature stored before an HMAC key change is computed again."""
+    service = SMSGatewayService(disk_config)
+    message = SMSMessage("1", "+374", "text", "2026-11-02T10:00:00Z")
+    service.message_queue.enqueue(message, "signature-with-old-key")
+    service.api_client.send_message = Mock(return_value=True)
+
+    service._process_queue()
+
+    signature = service.api_client.send_message.call_args[0][1]
+    assert signature == message.compute_signature(disk_config.hmac_secret_key)
+    service.stop()
+
+
+@patch('sms_gateway_service.AMIClient')
+@patch('sys.exit')
+def test_start_without_gateway_does_not_exit_if_queue_has_sms(mock_exit, mock_ami_class, disk_config):
+    """After a restart with SMS on disk, a gateway outage does not block their delivery."""
+    queue = SMSGatewayService(disk_config).message_queue
+    queue.enqueue(SMSMessage("1", "+374", "saved"), None)
+    queue.close()
+
+    mock_ami = Mock()
+    mock_ami.connect.return_value = False
+    mock_ami_class.return_value = mock_ami
+    service = SMSGatewayService(disk_config)
+
+    assert service.start() is False
+    mock_exit.assert_not_called()
+    service.stop()
+
+
+@patch('sms_gateway_service.AMIClient')
+@patch('sys.exit')
+def test_start_without_gateway_exits_if_queue_is_empty(mock_exit, mock_ami_class, disk_config):
+    mock_ami = Mock()
+    mock_ami.connect.return_value = False
+    mock_ami_class.return_value = mock_ami
+    service = SMSGatewayService(disk_config)
+
+    service.start()
+
+    mock_exit.assert_called_once_with(1)
+    service.stop()
