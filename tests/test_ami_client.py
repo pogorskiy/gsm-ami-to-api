@@ -197,3 +197,25 @@ class TestAMIClientConnection(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestLoginTrace(unittest.TestCase):
+    """The AMI password must not be written to trace.log."""
+
+    def test_login_trace_hides_password(self):
+        from unittest.mock import Mock, patch
+
+        client = AMIClient('127.0.0.1', 5038, 'admin', 's3cret-pass')
+        client._connected = True
+        client._socket = Mock()
+
+        with patch('ami_client._write_trace') as trace, \
+                patch.object(client, '_read_message', return_value={'Response': 'Success'}):
+            self.assertTrue(client.login())
+
+        traced = ''.join(call.args[1] for call in trace.call_args_list)
+        self.assertIn('Secret: ****', traced)
+        self.assertNotIn('s3cret-pass', traced)
+        # The real password is still sent to the gateway
+        sent = client._socket.sendall.call_args.args[0].decode()
+        self.assertIn('Secret: s3cret-pass', sent)

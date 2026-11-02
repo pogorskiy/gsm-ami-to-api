@@ -4,7 +4,34 @@ import logging
 import logging.handlers
 import sys
 import os
+import re
 from pathlib import Path
+
+
+# Telegram bot token inside a Bot API URL: /bot123456:ABC-def...
+_BOT_TOKEN_RE = re.compile(r'bot\d+:[A-Za-z0-9_-]+')
+
+# Third-party loggers that write request URLs (with the bot token) at DEBUG
+NOISY_LOGGERS = ('urllib3', 'requests')
+
+
+def redact_secrets(text: str) -> str:
+    """Replace Telegram bot tokens in text with a placeholder."""
+    return _BOT_TOKEN_RE.sub('bot<redacted>', text)
+
+
+def restrict_permissions(*patterns: str) -> None:
+    """Make existing files readable only by the owner (0600).
+
+    Args:
+        patterns: File names or glob patterns, e.g. 'sms_gateway.log*'
+    """
+    for pattern in patterns:
+        for path in Path().glob(pattern):
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
 
 
 class ComponentFormatter(logging.Formatter):
@@ -36,7 +63,8 @@ class ComponentFormatter(logging.Formatter):
         if record.exc_info:
             formatted += '\n' + self.formatException(record.exc_info)
         
-        return formatted
+        # Never write the bot token, even if a library puts it in a message or traceback
+        return redact_secrets(formatted)
     
     def _get_component_name(self, logger_name: str) -> str:
         """Convert logger name to component name.
@@ -134,6 +162,10 @@ def setup_logging(log_file: str = 'sms_gateway.log',
     file_handler.setLevel(file_level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
+    
+    # Do not log HTTP request URLs: they contain the Telegram bot token
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
     
     # Log startup message
     logging.info("Logging system initialized")

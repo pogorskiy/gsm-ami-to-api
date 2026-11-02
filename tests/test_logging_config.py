@@ -184,3 +184,52 @@ def test_timestamp_format():
             # Pattern for ISO 8601 timestamp in brackets
             pattern = r'\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\]'
             assert re.search(pattern, content) is not None
+
+
+TOKEN = "1234567890:AAH-fake_token_for_tests_1234567890ab"
+
+
+def test_redact_secrets():
+    from logging_config import redact_secrets
+    text = f"POST /bot{TOKEN}/sendMessage HTTP/1.1"
+    assert redact_secrets(text) == "POST /bot<redacted>/sendMessage HTTP/1.1"
+    assert redact_secrets("no secrets here") == "no secrets here"
+
+
+def test_bot_token_never_written_to_log_file():
+    """urllib3 DEBUG lines and tracebacks must not leak the bot token."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_file = os.path.join(tmpdir, 'test.log')
+        setup_logging(log_file=log_file)
+
+        # urllib3 writes request URLs at DEBUG
+        logging.getLogger('urllib3.connectionpool').debug(
+            '%s "POST /bot%s/sendMessage HTTP/1.1" 200', 'https://api.telegram.org:443', TOKEN)
+        # A warning from urllib3 is still logged, but without the token
+        logging.getLogger('urllib3.connectionpool').warning('Retrying /bot%s/sendMessage', TOKEN)
+        try:
+            raise RuntimeError(f"failed https://api.telegram.org/bot{TOKEN}/sendMessage")
+        except RuntimeError:
+            get_logger('test_module').exception("Request failed")
+
+        content = open(log_file).read()
+        assert TOKEN not in content
+        assert '"POST /bot' not in content          # DEBUG line is dropped
+        assert 'Retrying /bot<redacted>' in content  # WARNING is kept, redacted
+        assert 'bot<redacted>/sendMessage' in content
+
+
+def test_restrict_permissions(tmp_path, monkeypatch):
+    from logging_config import restrict_permissions
+    monkeypatch.chdir(tmp_path)
+    for name in ('sms_gateway.log', 'sms_gateway.log.1', 'trace.log', 'other.txt'):
+        (tmp_path / name).write_text('x')
+        os.chmod(tmp_path / name, 0o644)
+
+    restrict_permissions('sms_gateway.log*', 'trace.log', 'missing.log')
+
+    mode = lambda n: (tmp_path / n).stat().st_mode & 0o777
+    assert mode('sms_gateway.log') == 0o600
+    assert mode('sms_gateway.log.1') == 0o600
+    assert mode('trace.log') == 0o600
+    assert mode('other.txt') == 0o644

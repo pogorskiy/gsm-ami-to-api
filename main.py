@@ -16,10 +16,11 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from config import Config, DELIVERY_MODES
 from sms_gateway_service import SMSGatewayService
-from logging_config import setup_logging, get_logger
+from logging_config import setup_logging, get_logger, restrict_permissions
 
 
 def parse_args(argv=None):
@@ -38,8 +39,13 @@ def main():
     """Main entry point for the SMS Gateway Service."""
     args = parse_args()
     
+    # Logs and trace contain SMS texts: new files are readable only by the owner,
+    # existing ones are fixed too
+    os.umask(0o077)
+    
     # Initialize logging system first
     setup_logging()
+    restrict_permissions('sms_gateway.log*', 'trace.log')
     
     logger = get_logger(__name__)
     

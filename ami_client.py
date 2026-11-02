@@ -167,8 +167,8 @@ class AMIClient:
             )
             logger.info("Sending login command with username: %s", self.username)
             
-            # Trace outgoing command
-            _write_trace('SEND', login_cmd)
+            # Trace outgoing command (without the password)
+            _write_trace('SEND', login_cmd.replace(f"Secret: {self.password}", "Secret: ****"))
             
             self._socket.sendall(login_cmd.encode("utf-8"))
 
