@@ -84,6 +84,9 @@ class SMSGatewayService:
         self._next_reconnect_time = 0.0
         self._last_connect_time = float('-inf')
         
+        # Set by request_stop() (SIGTERM): the main loop ends after the current step
+        self._stop_requested = False
+        
         # Application-level keepalive tracking (optional, 0 to disable)
         self._last_ping_time = 0
         self._ping_interval = config.ping_interval
@@ -160,11 +163,11 @@ class SMSGatewayService:
         3. Attempts to deliver queued messages to the remote API
         4. Handles connection failures with reconnection logic
         
-        The loop runs indefinitely until interrupted or a fatal error occurs.
+        The loop runs until interrupted or request_stop() is called.
         """
         logger.info("Entering main event loop")
         
-        while True:
+        while not self._stop_requested:
             try:
                 # Check if we need to reconnect
                 if not self.ami_client.is_connected():
@@ -221,6 +224,17 @@ class SMSGatewayService:
                 logger.error(f"Unexpected error in main loop: {e}")
                 # Continue running despite errors
                 time.sleep(1)
+        else:
+            logger.info("Stop requested")
+            self.stop()
+    
+    def request_stop(self) -> None:
+        """Ask the main loop to stop (safe to call from a signal handler).
+        
+        The loop finishes its current step, so an SMS being parsed or queued
+        is not cut in the middle.
+        """
+        self._stop_requested = True
     
     def _process_early_events(self) -> None:
         """Queue SMS events that were received before the connection was lost."""
@@ -389,5 +403,11 @@ class SMSGatewayService:
         """Stop the service and clean up resources."""
         logger.info("Stopping SMS Gateway Service")
         self.ami_client.close()
+        try:
+            # SMS already received from the gateway but not queued yet go to the
+            # queue (on disk) - they are delivered after the restart
+            self._process_early_events()
+        except Exception as e:
+            logger.error(f"Could not queue received SMS on stop: {e}")
         self.message_queue.close()
         logger.info("Service stopped")

@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import os
+import signal
 import sys
 from config import Config, DELIVERY_MODES
 from sms_gateway_service import SMSGatewayService
@@ -57,6 +58,9 @@ def main():
         
         # Initialize the service
         service = SMSGatewayService(config)
+        
+        # systemctl stop / restart sends SIGTERM: stop cleanly, received SMS are saved
+        signal.signal(signal.SIGTERM, lambda signum, frame: service.request_stop())
         
         # Start the service (connect and authenticate)
         service.start()

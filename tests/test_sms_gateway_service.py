@@ -63,6 +63,7 @@ def test_start_connection_failure(mock_exit, mock_ami_class, mock_config):
     # Mock AMI client with connection failure
     mock_ami = Mock()
     mock_ami.connect.return_value = False
+    mock_ami.has_early_events.return_value = False
     mock_ami_class.return_value = mock_ami
     
     service = SMSGatewayService(mock_config)
@@ -492,6 +493,7 @@ def test_start_without_gateway_does_not_exit_if_queue_has_sms(mock_exit, mock_am
 
     mock_ami = Mock()
     mock_ami.connect.return_value = False
+    mock_ami.has_early_events.return_value = False
     mock_ami_class.return_value = mock_ami
     service = SMSGatewayService(disk_config)
 
@@ -505,6 +507,7 @@ def test_start_without_gateway_does_not_exit_if_queue_has_sms(mock_exit, mock_am
 def test_start_without_gateway_exits_if_queue_is_empty(mock_exit, mock_ami_class, disk_config):
     mock_ami = Mock()
     mock_ami.connect.return_value = False
+    mock_ami.has_early_events.return_value = False
     mock_ami_class.return_value = mock_ami
     service = SMSGatewayService(disk_config)
 
@@ -512,3 +515,22 @@ def test_start_without_gateway_exits_if_queue_is_empty(mock_exit, mock_ami_class
 
     mock_exit.assert_called_once_with(1)
     service.stop()
+
+
+def test_request_stop_ends_run_and_saves_received_sms(disk_config):
+    """SIGTERM: the loop ends, an SMS still in the AMI buffer is written to the queue."""
+    service = SMSGatewayService(disk_config)
+    event = AMIEvent('ReceivedSMS', {'Sender': '+374', 'Content': 'late'})
+    pending = [event]
+    service.ami_client = Mock()
+    service.ami_client.is_connected.return_value = True
+    service.ami_client.has_early_events.side_effect = lambda: bool(pending)
+    service.ami_client.read_event.side_effect = lambda: pending.pop() if pending else None
+    service.ami_client.parse_sms_event.side_effect = lambda e: SMSMessage("1", "+374", "late")
+    service.api_client.send_message = Mock(return_value=None)
+    service.request_stop()
+
+    service.run()
+
+    service.ami_client.close.assert_called_once()
+    assert _statuses(disk_config.queue_db_path) == ["pending"]
