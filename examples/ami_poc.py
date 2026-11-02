@@ -11,7 +11,7 @@ class YeastarAmiClient:
     Minimal, production-ready AMI client for Yeastar TG100.
     Features:
       - persistent connection with auto-reconnect;
-      - AMI login (apiuser/apipass);
+      - AMI login (username/secret from .env);
       - parsing text messages into dict;
       - calling custom on_sms() handler for incoming SMS events.
     """
@@ -20,8 +20,8 @@ class YeastarAmiClient:
         self,
         host: str,
         port: int = 5038,
-        username: str = "apiuser",
-        secret: str = "apipass",
+        username: str = "admin",
+        secret: str = "your-ami-password",
         reconnect_delay: float = 5.0,
         on_sms: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> None:
@@ -245,10 +245,10 @@ async def main() -> None:
     )
 
     client = YeastarAmiClient(
-        host="192.168.3.241",  # IP of your TG100
+        host="192.168.1.100",  # IP of your TG100
         port=5038,
-        username="apiuser",
-        secret="apipass",
+        username="admin",
+        secret="your-ami-password",
         reconnect_delay=5.0,
         on_sms=sms_handler,
     )
