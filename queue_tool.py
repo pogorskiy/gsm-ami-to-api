@@ -5,7 +5,8 @@ Look at the message queue database and retry failed messages.
 The running service delivers messages returned to 'pending' by itself,
 this tool does not send anything.
 
-Usage (in the service directory, as the owner of queue.db):
+Usage (in the service directory, as the owner of queue.db - the user the
+service runs as; other users are refused):
     python queue_tool.py list                  # pending and failed messages
     python queue_tool.py list --status sent    # delivered (kept for some days)
     python queue_tool.py show 42               # one message with its text
@@ -103,6 +104,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if not os.path.exists(args.db):
         print(f"Queue database not found: {args.db}", file=sys.stderr)
+        return 1
+    owner = os.stat(args.db).st_uid
+    if os.geteuid() != owner:
+        # SQLite creates -wal/-shm files owned by whoever opens the database:
+        # files owned by another user would break the service
+        print(f"Run as the owner of {args.db} (uid {owner}), e.g.: "
+              f"sudo -u '#{owner}' venv/bin/python3 queue_tool.py ...", file=sys.stderr)
         return 1
     # The database contains SMS texts: files created here are owner-only too
     os.umask(0o077)

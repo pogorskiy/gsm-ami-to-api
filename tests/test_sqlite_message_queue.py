@@ -302,3 +302,11 @@ def test_read_only_connection_is_reopened(db_path, monkeypatch):
     queue._next_open_time = 0.0
     assert queue.size() == 1
     assert [row['message'] for row in _rows(db_path)] == ["x"]
+
+
+def test_queue_tool_refuses_other_user(db_path, monkeypatch, capsys):
+    """Another user (e.g. root) would create -wal/-shm files the service cannot open."""
+    SQLiteMessageQueue(db_path).close()
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(db_path).st_uid + 1)
+    assert queue_tool.main(["--db", db_path, "list"]) == 1
+    assert "Run as the owner" in capsys.readouterr().err
