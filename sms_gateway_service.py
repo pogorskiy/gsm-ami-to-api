@@ -402,6 +402,11 @@ class SMSGatewayService:
     def stop(self) -> None:
         """Stop the service and clean up resources."""
         logger.info("Stopping SMS Gateway Service")
+        try:
+            # SMS the gateway has already sent may still be in the socket
+            self.ami_client.drain()
+        except Exception as e:
+            logger.error(f"Could not read the rest from TG100 on stop: {e}")
         self.ami_client.close()
         try:
             # SMS already received from the gateway but not queued yet go to the

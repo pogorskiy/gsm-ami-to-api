@@ -304,3 +304,23 @@ def test_keep_received_events_after_lost_connection(pair):
 
     event = client.read_event()
     assert event.fields['Sender'] == '.INECOBANK'
+
+
+def test_drain_reads_sms_still_in_socket(pair):
+    """On stop, an SMS already sent by the gateway (unread socket data) is kept."""
+    client, gateway = pair
+    gateway.sendall(b"Response: Success\r\nPing: Pong\r\n\r\n" + SMS_EVENT)
+
+    client.drain()
+    client.close()
+
+    event = client.read_event()
+    assert event.fields['Sender'] == '.INECOBANK'
+    assert not client.has_early_events()
+
+
+def test_drain_returns_quickly_without_data(pair):
+    client, gateway = pair
+    start = time.monotonic()
+    client.drain(timeout=0.1)
+    assert time.monotonic() - start < 1.0

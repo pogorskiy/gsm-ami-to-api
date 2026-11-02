@@ -15,7 +15,7 @@ def clean_env(monkeypatch):
                 'API_URL', 'API_BEARER_TOKEN', 'HMAC_SECRET_KEY', 
                 'INITIAL_RETRY_DELAY', 'MAX_RETRY_DELAY', 'PING_INTERVAL',
                 'DELIVERY_MODE', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID',
-                'TELEGRAM_REQUEST_TIMEOUT']
+                'TELEGRAM_REQUEST_TIMEOUT', 'SMS_GATEWAY_ENV_FILE', 'QUEUE_DB_PATH']
     for var in env_vars:
         monkeypatch.delenv(var, raising=False)
 
@@ -260,3 +260,20 @@ def test_invalid_mode(tmp_path, monkeypatch, capsys):
         Config.load_from_env()
 
     assert "DELIVERY_MODE" in capsys.readouterr().err
+
+
+def test_env_file_from_sms_gateway_env_file(tmp_path, monkeypatch):
+    """systemd can point to a settings file outside the working directory."""
+    work = tmp_path / "data"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    (tmp_path / "settings.env").write_text(
+        "TG100_HOST=192.168.1.100\nTG100_PORT=5038\nTG100_USERNAME=admin\nTG100_PASSWORD=secret\n"
+        "TELEGRAM_BOT_TOKEN=123:ABC\nTELEGRAM_CHAT_ID=1\n"
+    )
+    monkeypatch.setenv("SMS_GATEWAY_ENV_FILE", str(tmp_path / "settings.env"))
+
+    config = Config.load_from_env()
+
+    assert config.tg100_host == "192.168.1.100"
+    assert config.queue_db_path == "queue.db"

@@ -264,7 +264,22 @@ class SQLiteMessageQueue:
         return max(count, 0)
 
     def close(self) -> None:
-        """Close the database."""
+        """Close the database.
+
+        Messages kept in memory are written first if the database works again;
+        if not, the loss is logged.
+        """
+        self._retry_unsaved()
+        lost = self._memory.size() + len(self._memory_failed)
+        if lost:
+            logger.error(
+                f"{lost} message(s) could not be written to the queue database "
+                f"and are lost on exit (see the log above for their senders)"
+            )
+        self._close_connection()
+
+    def _close_connection(self) -> None:
+        """Close the database connection only (it is opened again when needed)."""
         if self._conn is not None:
             try:
                 self._conn.close()
@@ -302,7 +317,7 @@ class SQLiteMessageQueue:
                 self._error_logged = True
             if 'readonly' in str(e):
                 # Opened read-only: this connection never writes, open the file again later
-                self.close()
+                self._close_connection()
                 self._next_open_time = time.monotonic() + REOPEN_INTERVAL
             return None
         if self._error_logged:

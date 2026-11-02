@@ -310,3 +310,27 @@ def test_queue_tool_refuses_other_user(db_path, monkeypatch, capsys):
     monkeypatch.setattr(os, "geteuid", lambda: os.stat(db_path).st_uid + 1)
     assert queue_tool.main(["--db", db_path, "list"]) == 1
     assert "Run as the owner" in capsys.readouterr().err
+
+
+def test_close_writes_memory_messages_or_logs_loss(db_path, caplog):
+    queue = SQLiteMessageQueue(db_path)
+    real_conn = queue._conn
+
+    class FullDisk:
+        def execute(self, sql, *args):
+            if sql.startswith("INSERT"):
+                raise sqlite3.OperationalError("database or disk is full")
+            return real_conn.execute(sql, *args)
+
+        def close(self):
+            real_conn.close()
+
+    queue._conn = FullDisk()
+    queue.enqueue(_sms("stuck"), None)
+    queue.close()
+    assert "1 message(s) could not be written" in caplog.text
+
+    queue2 = SQLiteMessageQueue(db_path)
+    queue2._memory.enqueue(_sms("saved on close"), None)  # left by an earlier write error
+    queue2.close()
+    assert [row['message'] for row in _rows(db_path)] == ["saved on close"]

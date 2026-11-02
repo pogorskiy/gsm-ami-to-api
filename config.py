@@ -63,12 +63,14 @@ class Config:
         Raises:
             SystemExit: If configuration is invalid or .env file is missing
         """
-        # Try to load .env file
-        if not os.path.exists('.env'):
-            sys.stderr.write("Error: .env file not found. Please create one based on .env.example\n")
+        # Settings file: SMS_GATEWAY_ENV_FILE (e.g. set by systemd), default .env
+        # in the working directory
+        env_file = os.getenv('SMS_GATEWAY_ENV_FILE') or '.env'
+        if not os.path.exists(env_file):
+            sys.stderr.write(f"Error: {env_file} file not found. Please create one based on .env.example\n")
             sys.exit(1)
         
-        load_dotenv('.env', override=True)
+        load_dotenv(env_file, override=True)
         
         # Resolve delivery mode: CLI argument > DELIVERY_MODE > default
         mode = (delivery_mode or os.getenv('DELIVERY_MODE') or DEFAULT_DELIVERY_MODE).strip().lower()
