@@ -16,6 +16,7 @@ def mock_config():
     config.tg100_port = 5038
     config.tg100_username = "admin"
     config.tg100_password = "password"
+    config.delivery_mode = "relay"
     config.api_url = "https://api.example.com/sms"
     config.api_bearer_token = "test-token"
     config.hmac_secret_key = "test-secret"
@@ -234,3 +235,31 @@ def test_stop(mock_config):
     service.stop()
     
     service.ami_client.close.assert_called_once()
+
+
+def test_telegram_mode_uses_telegram_client(mock_config):
+    """In telegram mode the service sends straight to Telegram without signature."""
+    from telegram_delivery_client import TelegramDeliveryClient
+
+    mock_config.delivery_mode = "telegram"
+    mock_config.telegram_bot_token = "123:ABC"
+    mock_config.telegram_chat_id = "-100500"
+    mock_config.telegram_request_timeout = 15
+    service = SMSGatewayService(mock_config)
+
+    assert isinstance(service.api_client, TelegramDeliveryClient)
+
+    event = AMIEvent('ReceivedSMS', {'Span': '2', 'Sender': '+374', 'Content': 'hi'})
+    service._process_sms_event(event)
+
+    message, signature = service.message_queue.peek()
+    assert message.message == 'hi'
+    assert signature is None
+
+
+def test_relay_mode_uses_api_client(mock_config):
+    from api_delivery_client import APIDeliveryClient
+
+    service = SMSGatewayService(mock_config)
+
+    assert isinstance(service.api_client, APIDeliveryClient)

@@ -8,6 +8,7 @@ from config import Config
 from ami_client import AMIClient
 from message_queue import MessageQueue
 from api_delivery_client import APIDeliveryClient
+from telegram_delivery_client import TelegramDeliveryClient
 from retry_logic import calculate_exponential_backoff
 from logging_config import get_logger
 
@@ -60,10 +61,18 @@ class SMSGatewayService:
         
         self.message_queue = MessageQueue()
         
-        self.api_client = APIDeliveryClient(
-            api_url=config.api_url,
-            bearer_token=config.api_bearer_token
-        )
+        # Delivery client: straight to Telegram, or legacy relay server
+        if config.delivery_mode == 'relay':
+            self.api_client = APIDeliveryClient(
+                api_url=config.api_url,
+                bearer_token=config.api_bearer_token
+            )
+        else:
+            self.api_client = TelegramDeliveryClient(
+                bot_token=config.telegram_bot_token,
+                chat_id=config.telegram_chat_id,
+                timeout=config.telegram_request_timeout
+            )
         
         # Retry tracking for API delivery
         self._delivery_retry_count = 0
@@ -73,7 +82,7 @@ class SMSGatewayService:
         self._last_ping_time = 0
         self._ping_interval = config.ping_interval
         
-        logger.info("SMS Gateway Service initialized")
+        logger.info(f"SMS Gateway Service initialized (delivery mode: {config.delivery_mode})")
     
     def start(self) -> bool:
         """Start the service by connecting and authenticating with TG100.
@@ -171,7 +180,7 @@ class SMSGatewayService:
         """Process an SMS event (DongleNewSMSBase64 or ReceivedSMS).
         
         Extracts SMS data, creates an SMSMessage object, computes signature,
-        and adds it to the delivery queue.
+        and adds it to the delivery queue. The signature is computed only in relay mode.
         
         Args:
             event: AMIEvent of type DongleNewSMSBase64 or ReceivedSMS
@@ -183,8 +192,10 @@ class SMSGatewayService:
             # Parsing failed (already logged by ami_client)
             return
         
-        # Compute signature
-        signature = sms_message.compute_signature(self.config.hmac_secret_key)
+        # Compute signature (only the relay server checks it)
+        signature = None
+        if self.config.delivery_mode == 'relay':
+            signature = sms_message.compute_signature(self.config.hmac_secret_key)
         
         # Add to queue
         self.message_queue.enqueue(sms_message, signature)

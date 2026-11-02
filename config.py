@@ -7,6 +7,13 @@ from typing import Optional
 from dotenv import load_dotenv
 
 
+# Delivery modes:
+#   telegram - send SMS straight to Telegram Bot API (default)
+#   relay    - legacy: POST signed SMS to the relay server (gsm-to-telegram-bot)
+DELIVERY_MODES = ('telegram', 'relay')
+DEFAULT_DELIVERY_MODE = 'telegram'
+
+
 @dataclass
 class Config:
     """Configuration for SMS Gateway Service."""
@@ -17,12 +24,20 @@ class Config:
     tg100_username: str
     tg100_password: str
     
-    # Remote API parameters
-    api_url: str
-    api_bearer_token: str
+    # Delivery mode: 'telegram' or 'relay'
+    delivery_mode: str = DEFAULT_DELIVERY_MODE
     
-    # Security
-    hmac_secret_key: str
+    # Remote API parameters (relay mode)
+    api_url: Optional[str] = None
+    api_bearer_token: Optional[str] = None
+    
+    # Security (relay mode)
+    hmac_secret_key: Optional[str] = None
+    
+    # Telegram parameters (telegram mode)
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    telegram_request_timeout: int = 15
     
     # Operational parameters
     initial_retry_delay: int = 5
@@ -30,9 +45,12 @@ class Config:
     ping_interval: int = 300  # Keepalive ping interval in seconds (0 to disable)
     
     @staticmethod
-    def load_from_env() -> 'Config':
+    def load_from_env(delivery_mode: Optional[str] = None) -> 'Config':
         """
         Load configuration from .env file.
+        
+        Args:
+            delivery_mode: Overrides DELIVERY_MODE from .env ('telegram' or 'relay')
         
         Returns:
             Config: Loaded and validated configuration
@@ -47,16 +65,30 @@ class Config:
         
         load_dotenv('.env', override=True)
         
+        # Resolve delivery mode: CLI argument > DELIVERY_MODE > default
+        mode = (delivery_mode or os.getenv('DELIVERY_MODE') or DEFAULT_DELIVERY_MODE).strip().lower()
+        if mode not in DELIVERY_MODES:
+            sys.stderr.write(f"Error: DELIVERY_MODE must be one of {', '.join(DELIVERY_MODES)}, got '{mode}'\n")
+            sys.exit(1)
+        
         # Required environment variables
         required_vars = {
             'TG100_HOST': 'TG100 host address',
             'TG100_PORT': 'TG100 port number',
             'TG100_USERNAME': 'TG100 username',
             'TG100_PASSWORD': 'TG100 password',
-            'API_URL': 'Remote API URL',
-            'API_BEARER_TOKEN': 'API Bearer token',
-            'HMAC_SECRET_KEY': 'HMAC secret key',
         }
+        if mode == 'relay':
+            required_vars.update({
+                'API_URL': 'Remote API URL',
+                'API_BEARER_TOKEN': 'API Bearer token',
+                'HMAC_SECRET_KEY': 'HMAC secret key',
+            })
+        else:
+            required_vars.update({
+                'TELEGRAM_BOT_TOKEN': 'Telegram bot token',
+                'TELEGRAM_CHAT_ID': 'Telegram chat ID',
+            })
         
         # Check for missing required variables
         missing_vars = []
@@ -82,8 +114,8 @@ class Config:
             sys.exit(1)
         
         # Validate API_URL format
-        api_url = os.getenv('API_URL')
-        if not api_url.startswith('https://') and not api_url.startswith('http://'):
+        api_url = os.getenv('API_URL') or None
+        if mode == 'relay' and not api_url.startswith('https://') and not api_url.startswith('http://'):
             sys.stderr.write(f"Error: API_URL must start with http:// or https://, got '{api_url}'\n")
             sys.exit(1)
         
@@ -91,6 +123,7 @@ class Config:
         initial_retry_delay = 5
         max_retry_delay = 60
         ping_interval = 300
+        telegram_request_timeout = 15
         
         if os.getenv('INITIAL_RETRY_DELAY'):
             try:
@@ -122,14 +155,28 @@ class Config:
                 sys.stderr.write(f"Error: PING_INTERVAL must be a valid integer, got '{os.getenv('PING_INTERVAL')}'\n")
                 sys.exit(1)
         
+        if os.getenv('TELEGRAM_REQUEST_TIMEOUT'):
+            try:
+                telegram_request_timeout = int(os.getenv('TELEGRAM_REQUEST_TIMEOUT'))
+                if telegram_request_timeout <= 0:
+                    sys.stderr.write(f"Error: TELEGRAM_REQUEST_TIMEOUT must be positive, got {telegram_request_timeout}\n")
+                    sys.exit(1)
+            except ValueError:
+                sys.stderr.write(f"Error: TELEGRAM_REQUEST_TIMEOUT must be a valid integer, got '{os.getenv('TELEGRAM_REQUEST_TIMEOUT')}'\n")
+                sys.exit(1)
+        
         return Config(
             tg100_host=os.getenv('TG100_HOST'),
             tg100_port=tg100_port,
             tg100_username=os.getenv('TG100_USERNAME'),
             tg100_password=os.getenv('TG100_PASSWORD'),
+            delivery_mode=mode,
             api_url=api_url,
-            api_bearer_token=os.getenv('API_BEARER_TOKEN'),
-            hmac_secret_key=os.getenv('HMAC_SECRET_KEY'),
+            api_bearer_token=os.getenv('API_BEARER_TOKEN') or None,
+            hmac_secret_key=os.getenv('HMAC_SECRET_KEY') or None,
+            telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN') or None,
+            telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID') or None,
+            telegram_request_timeout=telegram_request_timeout,
             initial_retry_delay=initial_retry_delay,
             max_retry_delay=max_retry_delay,
             ping_interval=ping_interval,

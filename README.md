@@ -1,6 +1,24 @@
 # TG100 SMS Gateway Service
 
-A Python service that integrates Yeastar TG100 GSM gateway with external HTTPS APIs. The service connects to TG100 via the Asterisk Manager Interface (AMI) protocol, monitors incoming SMS messages in real-time, and forwards them to a remote API with HMAC-SHA256 cryptographic signatures for authenticity verification.
+A Python service that integrates Yeastar TG100 GSM gateway with Telegram. The service connects to TG100 via the Asterisk Manager Interface (AMI) protocol, monitors incoming SMS messages in real-time, and forwards them to Telegram.
+
+## Delivery Modes
+
+| Mode | How SMS goes to Telegram | Required settings |
+|------|--------------------------|-------------------|
+| `telegram` (default) | Straight to Telegram Bot API | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
+| `relay` (legacy) | Signed POST to the relay server (gsm-to-telegram-bot), which sends to Telegram | `API_URL`, `API_BEARER_TOKEN`, `HMAC_SECRET_KEY` |
+
+Choose the mode with `DELIVERY_MODE` in `.env` or at start:
+
+```bash
+python main.py                # mode from .env, default: telegram
+python main.py --mode relay   # legacy mode via relay server
+```
+
+Telegram errors: 400 — message is discarded; 401/403/404 (wrong token or chat), 429, 5xx and network errors — message stays in queue and is retried.
+
+The sections below about the remote API, message format and signature apply to `relay` mode only.
 
 ## Features
 

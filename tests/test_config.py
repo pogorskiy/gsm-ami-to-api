@@ -13,7 +13,9 @@ def clean_env(monkeypatch):
     """Clean environment variables before each test."""
     env_vars = ['TG100_HOST', 'TG100_PORT', 'TG100_USERNAME', 'TG100_PASSWORD', 
                 'API_URL', 'API_BEARER_TOKEN', 'HMAC_SECRET_KEY', 
-                'INITIAL_RETRY_DELAY', 'MAX_RETRY_DELAY']
+                'INITIAL_RETRY_DELAY', 'MAX_RETRY_DELAY', 'PING_INTERVAL',
+                'DELIVERY_MODE', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID',
+                'TELEGRAM_REQUEST_TIMEOUT']
     for var in env_vars:
         monkeypatch.delenv(var, raising=False)
 
@@ -28,6 +30,7 @@ def test_load_valid_config(tmp_path, monkeypatch):
         "TG100_PORT=5038\n"
         "TG100_USERNAME=admin\n"
         "TG100_PASSWORD=secret\n"
+        "DELIVERY_MODE=relay\n"
         "API_URL=https://api.example.com/sms/incoming\n"
         "API_BEARER_TOKEN=test-token\n"
         "HMAC_SECRET_KEY=test-secret-key\n"
@@ -57,6 +60,7 @@ def test_load_config_with_custom_retry_delays(tmp_path, monkeypatch):
         "TG100_PORT=5038\n"
         "TG100_USERNAME=admin\n"
         "TG100_PASSWORD=secret\n"
+        "DELIVERY_MODE=relay\n"
         "API_URL=https://api.example.com/sms/incoming\n"
         "API_BEARER_TOKEN=test-token\n"
         "HMAC_SECRET_KEY=test-secret-key\n"
@@ -91,6 +95,7 @@ def test_missing_required_variable(tmp_path, monkeypatch, capsys):
         "TG100_PORT=5038\n"
         "TG100_USERNAME=admin\n"
         "TG100_PASSWORD=secret\n"
+        "DELIVERY_MODE=relay\n"
         "API_URL=https://api.example.com/sms/incoming\n"
         "API_BEARER_TOKEN=test-token\n"
         "HMAC_SECRET_KEY=test-secret-key\n"
@@ -114,6 +119,7 @@ def test_invalid_port_non_numeric(tmp_path, monkeypatch, capsys):
         "TG100_PORT=not-a-number\n"
         "TG100_USERNAME=admin\n"
         "TG100_PASSWORD=secret\n"
+        "DELIVERY_MODE=relay\n"
         "API_URL=https://api.example.com/sms/incoming\n"
         "API_BEARER_TOKEN=test-token\n"
         "HMAC_SECRET_KEY=test-secret-key\n"
@@ -136,6 +142,7 @@ def test_invalid_port_out_of_range(tmp_path, monkeypatch, capsys):
         "TG100_PORT=99999\n"
         "TG100_USERNAME=admin\n"
         "TG100_PASSWORD=secret\n"
+        "DELIVERY_MODE=relay\n"
         "API_URL=https://api.example.com/sms/incoming\n"
         "API_BEARER_TOKEN=test-token\n"
         "HMAC_SECRET_KEY=test-secret-key\n"
@@ -158,6 +165,7 @@ def test_invalid_url_format(tmp_path, monkeypatch, capsys):
         "TG100_PORT=5038\n"
         "TG100_USERNAME=admin\n"
         "TG100_PASSWORD=secret\n"
+        "DELIVERY_MODE=relay\n"
         "API_URL=not-a-valid-url\n"
         "API_BEARER_TOKEN=test-token\n"
         "HMAC_SECRET_KEY=test-secret-key\n"
@@ -169,3 +177,86 @@ def test_invalid_url_format(tmp_path, monkeypatch, capsys):
     assert exc_info.value.code == 1
     captured = capsys.readouterr()
     assert "API_URL must start with http:// or https://" in captured.err
+
+
+TG100_ENV = (
+    "TG100_HOST=192.168.1.100\n"
+    "TG100_PORT=5038\n"
+    "TG100_USERNAME=admin\n"
+    "TG100_PASSWORD=secret\n"
+)
+
+
+def test_default_mode_is_telegram(tmp_path, monkeypatch):
+    """Without DELIVERY_MODE the service sends straight to Telegram."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        TG100_ENV +
+        "TELEGRAM_BOT_TOKEN=123:ABC\n"
+        "TELEGRAM_CHAT_ID=-100500\n"
+    )
+
+    config = Config.load_from_env()
+
+    assert config.delivery_mode == "telegram"
+    assert config.telegram_bot_token == "123:ABC"
+    assert config.telegram_chat_id == "-100500"
+    assert config.telegram_request_timeout == 15
+    assert config.api_url is None
+    assert config.hmac_secret_key is None
+
+
+def test_telegram_mode_requires_telegram_vars(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(TG100_ENV + "DELIVERY_MODE=telegram\n")
+
+    with pytest.raises(SystemExit) as exc_info:
+        Config.load_from_env()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "TELEGRAM_BOT_TOKEN" in err
+    assert "TELEGRAM_CHAT_ID" in err
+    assert "API_URL" not in err
+
+
+def test_relay_mode_requires_relay_vars(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        TG100_ENV +
+        "TELEGRAM_BOT_TOKEN=123:ABC\n"
+        "TELEGRAM_CHAT_ID=-100500\n"
+    )
+
+    with pytest.raises(SystemExit):
+        Config.load_from_env(delivery_mode="relay")
+
+    err = capsys.readouterr().err
+    assert "API_URL" in err
+    assert "HMAC_SECRET_KEY" in err
+
+
+def test_cli_mode_overrides_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        TG100_ENV +
+        "DELIVERY_MODE=telegram\n"
+        "API_URL=https://api.example.com/sms\n"
+        "API_BEARER_TOKEN=test-token\n"
+        "HMAC_SECRET_KEY=test-secret\n"
+    )
+
+    config = Config.load_from_env(delivery_mode="relay")
+
+    assert config.delivery_mode == "relay"
+    assert config.api_url == "https://api.example.com/sms"
+
+
+def test_invalid_mode(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(TG100_ENV + "DELIVERY_MODE=pigeon\n")
+
+    with pytest.raises(SystemExit):
+        Config.load_from_env()
+
+    assert "DELIVERY_MODE" in capsys.readouterr().err
