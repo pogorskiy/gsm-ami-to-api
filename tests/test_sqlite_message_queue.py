@@ -46,12 +46,12 @@ def test_fifo_order(db_path):
 
 def test_message_fields_are_kept(db_path):
     queue = SQLiteMessageQueue(db_path)
-    queue.enqueue(SMSMessage("span2", ".INECOBANK", "Код: 1234 <b>", "2026-11-02T10:35:00Z"), None)
+    queue.enqueue(SMSMessage("span2", ".EXAMPLEBANK", "Код: 1234 <b>", "2026-11-02T10:35:00Z"), None)
     queue.close()
 
     message, _ = SQLiteMessageQueue(db_path).peek()
     assert message.gateway_id == "span2"
-    assert message.sender == ".INECOBANK"
+    assert message.sender == ".EXAMPLEBANK"
     assert message.message == "Код: 1234 <b>"
     assert message.timestamp == "2026-11-02T10:35:00Z"
 

@@ -44,8 +44,8 @@ def test_format_escapes_html_and_keeps_layout(message):
 
 @pytest.mark.parametrize("raw, expected", [
     # Real TG100 format: form-style URL encoding
-    ("Your+Inecobank+Online-Banking+Security+Code+is+1234%3ADo+not+pass",
-     "Your Inecobank Online-Banking Security Code is 1234:Do not pass"),
+    ("Your+Examplebank+Online-Banking+Security+Code+is+1234%3ADo+not+pass",
+     "Your Examplebank Online-Banking Security Code is 1234:Do not pass"),
     ("%EF%BB%BFfriend+request%3A+https%3A%2F%2Ffb.me%2Fabc",
      "friend request: https://fb.me/abc"),
     ("%D0%9A%D0%BE%D0%B4+%2B374", "Код +374"),

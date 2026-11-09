@@ -11,7 +11,7 @@ from ami_client import AMIClient
 SMS_EVENT = (
     b"Event: ReceivedSMS\r\n"
     b"Privilege: all,smscommand\r\n"
-    b"Sender: .INECOBANK\r\n"
+    b"Sender: .EXAMPLEBANK\r\n"
     b"Recvtime: 2026-11-02 13:41:30\r\n"
     b"Content: Your+code+is+1234\r\n"
     b"\r\n"
@@ -47,20 +47,20 @@ def test_event_in_parts_with_long_pause_is_not_lost(pair):
     message = client._read_message(timeout=0.5)
 
     assert message['Event'] == 'ReceivedSMS'
-    assert message['Sender'] == '.INECOBANK'
+    assert message['Sender'] == '.EXAMPLEBANK'
     assert message['Content'] == 'Your+code+is+1234'
 
 
 def test_two_events_in_one_packet_need_no_more_data(pair):
     client, gateway = pair
-    gateway.sendall(SMS_EVENT + SMS_EVENT.replace(b'.INECOBANK', b'.Ardshin'))
+    gateway.sendall(SMS_EVENT + SMS_EVENT.replace(b'.EXAMPLEBANK', b'.OTHERBANK'))
 
     first = client._read_message(timeout=0.5)
     start = time.monotonic()
     second = client._read_message(timeout=2.0)
 
-    assert first['Sender'] == '.INECOBANK'
-    assert second['Sender'] == '.Ardshin'
+    assert first['Sender'] == '.EXAMPLEBANK'
+    assert second['Sender'] == '.OTHERBANK'
     assert time.monotonic() - start < 0.5  # taken from the buffer, not waited for
 
 
@@ -70,7 +70,7 @@ def test_broken_utf8_line_is_kept(pair):
 
     message = client._read_message(timeout=0.5)
 
-    assert message['Sender'] == '.INECOBANK'
+    assert message['Sender'] == '.EXAMPLEBANK'
     assert message['Content'] == 'code � 1234'
 
 
@@ -101,7 +101,7 @@ def test_event_during_login_is_returned_by_read_event(pair):
     event = client.read_event()
 
     assert event.event_type == 'ReceivedSMS'
-    assert event.fields['Sender'] == '.INECOBANK'
+    assert event.fields['Sender'] == '.EXAMPLEBANK'
 
 
 def _fake_gateway(payload, close_after=1.0):
@@ -140,7 +140,7 @@ def test_data_sent_with_banner_is_not_lost():
         assert client.connect() is True
         event = client.read_event()
         assert event is not None
-        assert event.fields['Sender'] == '.INECOBANK'
+        assert event.fields['Sender'] == '.EXAMPLEBANK'
     finally:
         client.close()
         stop()
@@ -213,7 +213,7 @@ def test_early_events_returned_after_disconnect(pair):
     assert client.has_early_events()
 
     event = client.read_event()
-    assert event.fields['Sender'] == '.INECOBANK'
+    assert event.fields['Sender'] == '.EXAMPLEBANK'
     assert not client.has_early_events()
 
 
@@ -270,7 +270,7 @@ def test_next_message_does_not_count_towards_current_size(pair, monkeypatch):
     gateway.sendall(big + SMS_EVENT)  # together over the limit
 
     assert client._read_message(timeout=0.5)['Event'] == 'Big'
-    assert client._read_message(timeout=0.5)['Sender'] == '.INECOBANK'
+    assert client._read_message(timeout=0.5)['Sender'] == '.EXAMPLEBANK'
 
 
 def test_complete_message_over_line_limit_is_rejected(pair, monkeypatch):
@@ -290,7 +290,7 @@ def test_close_keeps_complete_sms_from_buffer(pair):
 
     assert client.has_early_events()
     event = client.read_event()
-    assert event.fields['Sender'] == '.INECOBANK'
+    assert event.fields['Sender'] == '.EXAMPLEBANK'
     assert not client.has_early_events()
 
 
@@ -303,7 +303,7 @@ def test_keep_received_events_after_lost_connection(pair):
     client.keep_received_events()
 
     event = client.read_event()
-    assert event.fields['Sender'] == '.INECOBANK'
+    assert event.fields['Sender'] == '.EXAMPLEBANK'
 
 
 def test_drain_reads_sms_still_in_socket(pair):
@@ -315,7 +315,7 @@ def test_drain_reads_sms_still_in_socket(pair):
     client.close()
 
     event = client.read_event()
-    assert event.fields['Sender'] == '.INECOBANK'
+    assert event.fields['Sender'] == '.EXAMPLEBANK'
     assert not client.has_early_events()
 
 
@@ -339,4 +339,4 @@ def test_drain_waits_for_rest_of_half_received_sms(pair):
     client.drain(timeout=0.3, limit=5.0)
     client.close()
 
-    assert client.read_event().fields['Sender'] == '.INECOBANK'
+    assert client.read_event().fields['Sender'] == '.EXAMPLEBANK'
